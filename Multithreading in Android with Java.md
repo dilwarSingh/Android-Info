@@ -16,6 +16,11 @@
 12. [Executors and `ThreadPoolExecutor`](#12-executors-and-threadpoolexecutor)
 13. [Efficient ThreadPool for CPU-Intensive Tasks](#13-efficient-threadpool-for-cpu-intensive-tasks)
 14. [Efficient ThreadPool for IO-Intensive Tasks](#14-efficient-threadpool-for-io-intensive-tasks)
+15. [`ThreadLocal` in Android](#15-threadlocal-in-android)
+16. [`CompletableFuture` (API 24+)](#16-completablefuture-api-24)
+17. [Concurrent Collections](#17-concurrent-collections)
+18. [`ScheduledExecutorService`](#18-scheduledexecutorservice)
+19. [Virtual Threads and Project Loom](#19-virtual-threads-and-project-loom)
 
 ---
 
@@ -37,7 +42,7 @@ Android apps run in a single-threaded world by default. Every UI update, every t
 Java Primitives          →  Thread, Runnable, Callable, Future, synchronized, volatile
 Java Concurrency Utils   →  Locks, Atomics, Executors, BlockingQueue
 Android OS Layer         →  Looper, MessageQueue, Handler, HandlerThread, Choreographer
-High-level Abstractions  →  AsyncTask (deprecated), WorkManager, RxJava, Kotlin Coroutines
+High-level Abstractions  →  AsyncTask (deprecated API 30), WorkManager, RxJava, Kotlin Coroutines
 ```
 
 This document focuses on the **Java primitives** and **Android OS layer** — the foundation that every higher-level abstraction is built on.
@@ -48,7 +53,7 @@ This document focuses on the **Java primitives** and **Android OS layer** — th
 
 ### 2.1 `Thread`
 
-`Thread` is the fundamental unit of concurrency in Java. Each `Thread` has its own **stack** (default ~512 KB on Android), a program counter, and local variables. Threads within the same process share the **heap** (objects, static fields).
+`Thread` is the fundamental unit of concurrency in Java. Each `Thread` has its own **stack** (minimum ~64 KB on Android/ART; grows on demand for deep call stacks — desktop JVM defaults are 512 KB–1 MB, but Android uses a more conservative minimum), a program counter, and local variables. Threads within the same process share the **heap** (objects, static fields).
 
 #### Thread Lifecycle
 
@@ -66,15 +71,16 @@ This document focuses on the **Java primitives** and **Android OS layer** — th
                                                       ▼
                                               WAITING / TIMED_WAITING
                                                       │
-                                                      │ (notify/notifyAll,
-                                                      │  timeout, unpark)
-                                                      └──────────► RUNNABLE
+                                                      │ timeout / unpark / join-done ─► RUNNABLE
+                                                      │ notify / notifyAll ─► BLOCKED (must re-acquire
+                                                      │                       the monitor) ─► RUNNABLE
+                                                      └──────────► (see above)
 ```
 
 - **NEW**: `Thread` object created but `start()` not yet called.
 - **RUNNABLE**: Thread is eligible to run (may or may not be currently executing on a CPU core). Note: from the JVM's perspective, both "ready to run" and "currently executing" are RUNNABLE.
 - **BLOCKED**: Waiting **exclusively** to acquire a monitor lock (`synchronized` block/method). Transitions back to RUNNABLE once the lock is acquired.
-- **WAITING**: Indefinitely paused via `Object.wait()`, `Thread.join()` (no timeout), or `LockSupport.park()`. Requires an explicit `notify()` / `notifyAll()` / `unpark()` to wake up.
+- **WAITING**: Indefinitely paused via `Object.wait()`, `Thread.join()` (no timeout), or `LockSupport.park()`. Requires an explicit `notify()` / `notifyAll()` / `unpark()` to wake up. **Note:** a thread woken from `Object.wait()` released the monitor when it began waiting, so after `notify()` it must **re-acquire that monitor** — it passes through **BLOCKED** before reaching RUNNABLE. Wakes from `park()`, `join()` completion, or a timeout go straight to RUNNABLE (no monitor to reacquire).
 - **TIMED_WAITING**: Same as WAITING but with a timeout — via `Thread.sleep(n)`, `Object.wait(n)`, `Thread.join(n)`, `LockSupport.parkNanos()`. Automatically transitions back to RUNNABLE when the timeout expires.
 - **TERMINATED**: `run()` method has returned normally or via an uncaught exception. Cannot be restarted.
 
@@ -321,7 +327,9 @@ backgroundHandler.post(() -> {
 handlerThread.quitSafely();
 ```
 
-`HandlerThread` is used internally by Android for things like `Camera` callbacks, `IntentService`, and `AsyncQueryHandler`. It is ideal for **serialized** background operations (one at a time, in order).
+`HandlerThread` is used internally by Android for things like the deprecated `Camera` (Camera1) API callbacks and `AsyncQueryHandler`. Modern camera frameworks (CameraX / Camera2) manage their own internal threading. It is ideal for **serialized** background operations (one at a time, in order).
+
+> ⚠️ **Note**: `IntentService`, which also used `HandlerThread` internally, was **deprecated in API 30 (Android 11)** in favor of `WorkManager` (for deferrable work) or a foreground `Service` / coroutines (for immediate work). Similarly, `AsyncTask` was also **deprecated in API 30 (Android 11)** — use Kotlin coroutines or `Executor`-based APIs instead. (`JobIntentService` is also deprecated — don't adopt it for new code.)
 
 ---
 
@@ -350,7 +358,7 @@ handlerThread.quitSafely();
 
 ### 3.1 The Java Memory Model (JMM)
 
-Modern CPUs have **multi-level caches** (L1, L2, L3). Each CPU core may cache a copy of a shared variable. Without synchronization, one thread's write may never become visible to another thread — this is called a **visibility problem**.
+Without synchronization, one thread's write to a shared variable may never become visible to another thread — this is called a **visibility problem**. On modern hardware the cause is usually **not** stale CPU caches (caches are kept coherent by protocols like MESI); the real culprits are **compiler/JIT optimizations** (e.g. hoisting a field read into a register so the loop never re-reads memory) and **instruction reordering / store buffers**.
 
 The JMM defines **happens-before** relationships that guarantee when one thread's actions are visible to another. The key rules:
 - A write to a `volatile` variable happens-before any subsequent read of that variable.
@@ -361,8 +369,8 @@ The JMM defines **happens-before** relationships that guarantee when one thread'
 ### 3.2 `volatile`
 
 `volatile` ensures that **all threads see the most up-to-date value** of a variable by:
-1. Bypassing CPU caches — reads/writes go directly to main memory.
-2. Preventing instruction reordering around the volatile access (memory barrier).
+1. Forbidding the compiler/JIT from caching the variable in a register and inserting **memory barriers** (fences) so each read goes to, and each write is published to, shared memory. (Hardware caches are already coherent via protocols like MESI; the barrier's job is to stop the reorderings and register-caching that would otherwise hide a write.)
+2. Preventing instruction reordering around the volatile access (the memory barrier also serves as a **compiler and CPU reordering fence**).
 
 ```java
 // Without volatile — other threads may see stale value of 'running'
@@ -468,7 +476,7 @@ private static volatile Singleton instance;
 #### Locking on the Wrong Object
 
 ```java
-// WRONG — 'this' refers to a new anonymous Runnable, not shared
+// WRONG — a new Object is created each time, so no two threads ever lock on the same instance
 synchronized (new Object()) { ... }
 
 // WRONG — Integer/String literals may be cached/shared unexpectedly
@@ -732,7 +740,7 @@ try {
 
 ### 6.1 `Thread.stop()` is Deprecated and Dangerous
 
-Java originally had `Thread.stop()`, but it was **deprecated in Java 1.2** (formally marked with the `@Deprecated` annotation) and has never been safe to use. In **desktop JDK 21**, it was finally removed. On Android (which runs its own **ART runtime**, not desktop OpenJDK), `Thread.stop()` still exists in the API but must **never** be called because it is fundamentally unsafe:
+Java originally had `Thread.stop()`, but it was **deprecated in Java 1.2** (formally marked with the `@Deprecated` annotation) and has never been safe to use. In **desktop JDK 20**, it was changed to unconditionally throw `UnsupportedOperationException` (JDK 18 had terminally deprecated it), effectively disabling it. On Android (which runs its own **ART runtime**, not desktop OpenJDK), `Thread.stop()` still exists in the API but must **never** be called because it is fundamentally unsafe:
 
 When `Thread.stop()` is called:
 1. It throws a `ThreadDeath` Error **at any arbitrary point** in the target thread's execution.
@@ -870,11 +878,11 @@ If any of these steps takes too long, a frame is skipped → **jank**.
 | Trigger | Threshold |
 |---|---|
 | Activity not responding to input | **5 seconds** |
-| `BroadcastReceiver.onReceive()` not completing (foreground app) | **10 seconds** |
-| `BroadcastReceiver.onReceive()` not completing (background app) | **60 seconds** |
+| `BroadcastReceiver.onReceive()` not completing (foreground priority intent, i.e. `FLAG_RECEIVER_FOREGROUND`) | **10 seconds** (Android 13 and lower); **10–20 seconds** (Android 14+, dynamically scaled based on CPU starvation) |
+| `BroadcastReceiver.onReceive()` not completing (background priority intent) | **60 seconds** (Android 13 and lower); **60–120 seconds** (Android 14+, dynamically scaled based on CPU starvation) |
 | Foreground `Service` not completing `onStartCommand()` / `onBind()` | **20 seconds** |
 | Background `Service` not completing | **200 seconds** |
-| `ContentProvider` not responding | **10 seconds** |
+| `ContentProvider` not responding | No fixed default timeout. The timeout is specified by the caller via `ContentProviderClient.setDetectNotResponding()`. |
 
 > **Note**: These thresholds are approximate and can vary by Android version and OEM customizations. Starting from Android 11, background process ANR enforcement became stricter. Always measure with real devices.
 
@@ -974,7 +982,7 @@ public static void main(String[] args) {
 }
 ```
 
-Every `Activity` launch, `onResume()`, touch event, and layout pass is delivered as a `Message` to this `ActivityThread`'s `Handler` (`mH`), which dispatches to the appropriate lifecycle method.
+Framework-level `Activity` lifecycle callbacks (launch, `onResume()`, etc.) are delivered as `Message`s to this `ActivityThread`'s `Handler` (`mH`), which dispatches to the appropriate lifecycle method. Note that **input/touch events** do not go through `mH` — they arrive over an `InputChannel` and are dispatched by an `InputEventReceiver` on the Looper (→ `ViewRootImpl`), and **layout/draw traversals** are scheduled by `Choreographer` on `ViewRootImpl`'s own handler.
 
 ---
 
@@ -1324,6 +1332,8 @@ handler.sendMessage(msg);
 
 > ⚠️ `MessageQueue.postSyncBarrier()` is a `@hide` API — do not use it directly in production apps.
 
+> **Android 17 (API 37) note:** Beginning with Android 17, apps targeting API 37 or higher receive a **new lock-free `MessageQueue` implementation**. Internally, `mMessages` is always null in the new implementation and the data structures have changed. The public API surface (`Handler`, `Looper`, `Message`) is unchanged, but low-level introspection of `MessageQueue` internals via reflection will break. All code that uses the public API continues to work without modification.
+
 ---
 
 ## 9. VSYNC and the Display Pipeline
@@ -1586,11 +1596,14 @@ Semaphore semaphore = new Semaphore(3);
 executor.execute(() -> {
     try {
         semaphore.acquire();     // blocks if 3 permits are already taken
-        useDatabase();
     } catch (InterruptedException e) {
         Thread.currentThread().interrupt();
+        return;                  // interrupted before acquiring — no permit taken, do NOT release
+    }
+    try {
+        useDatabase();
     } finally {
-        semaphore.release();     // always release in finally
+        semaphore.release();     // release only after a successful acquire
     }
 });
 ```
@@ -1815,10 +1828,10 @@ BlockingQueue<Task> fairQ = new ArrayBlockingQueue<>(50, true /* fair */);
 Single ReentrantLock protects all access:
 
   items[] = [ ][ ][item2][item3][item4][ ][ ]
-              ↑putIndex  ↑takeIndex
-              (next      (oldest item,
-               empty     removed next)
-               slot)
+                    ↑takeIndex          ↑putIndex
+                    (oldest item,       (next
+                     removed next)       empty
+                                         slot)
   
   take() removes from takeIndex → takeIndex advances right (wraps)
   put()  inserts at  putIndex  → putIndex  advances right (wraps)
@@ -1902,7 +1915,7 @@ PriorityTask next = q.take(); // returns urgentWork (priority=1)
 
 - ✅ Automatic task prioritization without manual reordering
 - ⚠️ **Unbounded** — can grow without limit, risk of OOM
-- ⚠️ `take()` never blocks (always available if non-empty) — use carefully with memory
+- ⚠️ `put()` never blocks (unbounded queue) — can silently consume all memory if production outpaces consumption
 - ⚠️ FIFO order is NOT guaranteed for elements with equal priority
 
 **Use `PriorityBlockingQueue` when**:
@@ -2071,15 +2084,23 @@ Exchanger<DataBuffer> exchanger = new Exchanger<>();
 // Producer
 executor.execute(() -> {
     DataBuffer buffer = fillBuffer();
-    DataBuffer emptyBuffer = exchanger.exchange(buffer); // swap
-    // now use emptyBuffer for next fill
+    try {
+        DataBuffer emptyBuffer = exchanger.exchange(buffer); // swap (throws InterruptedException)
+        // now use emptyBuffer for next fill
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+    }
 });
 
 // Consumer
 executor.execute(() -> {
     DataBuffer emptyBuffer = new DataBuffer();
-    DataBuffer fullBuffer = exchanger.exchange(emptyBuffer); // swap
-    processBuffer(fullBuffer);
+    try {
+        DataBuffer fullBuffer = exchanger.exchange(emptyBuffer); // swap (throws InterruptedException)
+        processBuffer(fullBuffer);
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+    }
 });
 ```
 
@@ -2142,13 +2163,22 @@ if (lock.tryLock()) {
     // Lock not available, do something else
 }
 
-// Try to acquire with timeout
-if (lock.tryLock(100, TimeUnit.MILLISECONDS)) {
-    try { count++; } finally { lock.unlock(); }
+// Try to acquire with timeout (throws InterruptedException — handle it)
+try {
+    if (lock.tryLock(100, TimeUnit.MILLISECONDS)) {
+        try { count++; } finally { lock.unlock(); }
+    }
+} catch (InterruptedException e) {
+    Thread.currentThread().interrupt();
 }
 
 // Acquire in a way that can be interrupted (useful for cancellable tasks)
-lock.lockInterruptibly();
+try {
+    lock.lockInterruptibly();
+    try { count++; } finally { lock.unlock(); }
+} catch (InterruptedException e) {
+    Thread.currentThread().interrupt();
+}
 
 // Fair lock: threads acquire in the order they requested the lock
 ReentrantLock fairLock = new ReentrantLock(true /* fair */);
@@ -2233,9 +2263,9 @@ public void updateUser(String id, User user) {
 
 ---
 
-### 11.5 `StampedLock` (Java 8 / Android API 26+)
+### 11.5 `StampedLock` (Java 8 / Android API 24+)
 
-`StampedLock` was introduced in Java 8. On Android, it is available natively from **API 26 (Android 8.0)**. With Android Gradle Plugin's core library desugaring enabled, it can be used from **API 24 (Android 7.0)**.
+`StampedLock` was introduced in Java 8. On Android, it is available natively from **API 24 (Android 7.0)**. It is **not** backported by core library desugaring, so for apps targeting API < 24, `StampedLock` is unavailable — use `ReentrantReadWriteLock` instead.
 
 `StampedLock` offers three modes and is designed for **high-throughput, read-heavy workloads**:
 
@@ -2292,7 +2322,7 @@ Need tryLock, timeout, interruptibility, or multiple conditions?
 Many more reads than writes?
     └─► ReentrantReadWriteLock
 
-Maximum performance, read-heavy, low contention, API 26+ (or API 24+ with desugaring)?
+Maximum performance, read-heavy, low contention, API 24+ (not backported by desugaring)?
     └─► StampedLock (with optimistic reads)
 ```
 
@@ -2522,7 +2552,9 @@ public static ThreadPoolExecutor createCpuBoundPool() {
         new ThreadPoolExecutor.CallerRunsPolicy()   // backpressure when full
     );
 
-    // Allow core threads to time out too (optional, saves memory when idle)
+    // To let core threads time out too (saves memory when idle), first set a
+    // non-zero keepAliveTime above, then enable it. Calling this with keepAliveTime == 0
+    // throws IllegalArgumentException ("Core threads must have nonzero keep alive times").
     // executor.allowCoreThreadTimeOut(true);
 
     return executor;
@@ -2560,7 +2592,7 @@ Android has its own **Linux nice-value** based thread priority system exposed vi
 |---|---|---|
 | `THREAD_PRIORITY_URGENT_DISPLAY` | -8 | SurfaceFlinger binder thread, input reader — system-level only |
 | `THREAD_PRIORITY_DISPLAY` | -4 | **RenderThread** (hardware-accelerated drawing thread) |
-| `THREAD_PRIORITY_URGENT_AUDIO` | -16 | Audio playback threads |
+| `THREAD_PRIORITY_URGENT_AUDIO` | -19 | Audio playback threads |
 | `THREAD_PRIORITY_AUDIO` | -16 | Audio processing |
 | `THREAD_PRIORITY_DEFAULT` | 0 | **Main (UI) Thread**, normal threads |
 | `THREAD_PRIORITY_FOREGROUND` | -2 | Foreground app worker threads |
@@ -2707,7 +2739,7 @@ int cpuCount = Runtime.getRuntime().availableProcessors();
 int ioThreadCount = Math.min(cpuCount * 4, 32); // e.g., 16–32
 ```
 
-Each idle thread consumes ~512 KB–1 MB of stack memory. On Android with limited RAM, cap your I/O thread count to **16–32** unless you have profiling data to justify more.
+Each thread on Android costs a **minimum of ~64 KB of stack memory** (per official Android performance docs); the working stack grows on demand for deep call stacks. On Android with limited RAM, cap your I/O thread count to **16–32** unless you have profiling data to justify more.
 
 ---
 
@@ -2842,9 +2874,9 @@ userRepository.fetchUser("user123",
 
 ### 14.7 Memory Considerations on Android
 
-Each thread allocates a stack:
-- Default Java stack: ~512 KB–1 MB
-- 32 threads × 512 KB = **16 MB** just for stacks
+Each thread allocates a stack. On Android (ART runtime), the **minimum stack cost per thread is ~64 KB** (per official Android threading docs), though the stack grows on demand and active threads with deep call stacks consume significantly more:
+- Minimum stack (Android/ART): ~64 KB per thread
+- At 32 threads × 64 KB minimum = ~2 MB; real-world usage with active stacks is higher
 
 On devices with 2 GB RAM where your app might have 256–512 MB heap limit, 16 MB for thread stacks is significant. Profile and tune your thread counts accordingly.
 
@@ -2857,6 +2889,624 @@ Log.d(TAG, "Active threads: " + threadCount + " (~" + estimatedStackMb + " MB st
 
 ---
 
+## 15. `ThreadLocal` in Android
+
+### 15.1 What is `ThreadLocal`?
+
+`ThreadLocal<T>` provides **per-thread storage** — each thread that accesses a `ThreadLocal` variable gets its **own independent copy**. Reads and writes by one thread are completely invisible to other threads.
+
+```java
+ThreadLocal<SimpleDateFormat> dateFormat = ThreadLocal.withInitial(
+    () -> new SimpleDateFormat("yyyy-MM-dd", Locale.US)
+);
+
+// Each thread gets its own SimpleDateFormat instance (SimpleDateFormat is NOT thread-safe)
+executor.execute(() -> {
+    String date = dateFormat.get().format(new Date()); // thread-local instance
+});
+```
+
+---
+
+### 15.2 How Android Uses `ThreadLocal` Internally
+
+`ThreadLocal` is **critical** to Android's threading model. The most important usage is inside `Looper`:
+
+```java
+// From Android source — Looper.java (simplified)
+static final ThreadLocal<Looper> sThreadLocal = new ThreadLocal<>();
+
+public static void prepare() {
+    if (sThreadLocal.get() != null) {
+        throw new RuntimeException("Only one Looper may be created per thread");
+    }
+    sThreadLocal.set(new Looper());  // each thread gets its own Looper
+}
+
+public static @Nullable Looper myLooper() {
+    return sThreadLocal.get();  // returns THIS thread's Looper
+}
+```
+
+This is why `Looper.myLooper()` returns different `Looper` objects depending on which thread calls it — the `Looper` reference is stored in a `ThreadLocal`.
+
+---
+
+### 15.3 Common Use Cases
+
+```java
+// 1. Thread-safe formatters (SimpleDateFormat, NumberFormat are NOT thread-safe)
+private static final ThreadLocal<SimpleDateFormat> formatter =
+    ThreadLocal.withInitial(() -> new SimpleDateFormat("HH:mm:ss", Locale.US));
+
+// 2. Per-thread transaction context
+private static final ThreadLocal<Transaction> currentTransaction = new ThreadLocal<>();
+
+public void beginTransaction() {
+    currentTransaction.set(new Transaction());
+}
+
+public Transaction getCurrentTransaction() {
+    return currentTransaction.get(); // returns null if not set on this thread
+}
+
+// 3. Per-thread recursive depth counter (avoid passing through method signatures)
+private static final ThreadLocal<Integer> recursionDepth =
+    ThreadLocal.withInitial(() -> 0);
+```
+
+---
+
+### 15.4 Memory Leak Warning
+
+`ThreadLocal` values are stored in a `ThreadLocalMap` inside each `Thread` object. If the thread lives long (e.g., in a thread pool), the value persists — even if your code no longer references the `ThreadLocal` key:
+
+```java
+// ❌ DANGEROUS in a thread pool: value is never cleaned up
+executor.execute(() -> {
+    threadLocalVar.set(largeObject);  // stored in the pool thread's ThreadLocalMap
+    doWork();
+    // forgot to call threadLocalVar.remove()!
+    // The thread returns to the pool with largeObject still attached
+});
+
+// ✅ CORRECT: Always remove in a finally block
+executor.execute(() -> {
+    try {
+        threadLocalVar.set(largeObject);
+        doWork();
+    } finally {
+        threadLocalVar.remove(); // CRITICAL: clean up before returning to pool
+    }
+});
+```
+
+> ⚠️ **Rule**: If you use `ThreadLocal` with a thread pool (`ExecutorService`), **always call `remove()` in a `finally` block** to prevent memory leaks and stale data.
+
+---
+
+### 15.5 `InheritableThreadLocal`
+
+Standard `ThreadLocal` values are **not** inherited by child threads. `InheritableThreadLocal` copies the parent thread's value to the child:
+
+```java
+InheritableThreadLocal<String> requestId = new InheritableThreadLocal<>();
+requestId.set("REQ-123");
+
+new Thread(() -> {
+    Log.d("TAG", requestId.get()); // "REQ-123" — inherited from parent
+}).start();
+```
+
+> ⚠️ `InheritableThreadLocal` only copies at **thread creation time**. It does NOT work with thread pools (where threads are reused, not created fresh). For thread pool scenarios, you must manually propagate context.
+
+---
+
+## 16. `CompletableFuture` (API 24+)
+
+### 16.1 Overview
+
+`CompletableFuture<T>` (added in Java 8, available on Android natively from **API 24** — there is **no core library desugaring support** for `CompletableFuture`, so API 24 is the hard minimum) is a major upgrade over `Future<T>`. While `Future` only supports blocking `get()`, `CompletableFuture` enables:
+
+- **Non-blocking** chaining of async operations
+- **Composing** multiple async operations (combine, either/both)
+- **Exception handling** built into the chain
+- **Manual completion** from any thread
+
+```
+Future<V>:         submit(task) → future.get() [BLOCKS]
+CompletableFuture: supplyAsync(task) → .thenApply(transform) → .thenAccept(consume) [NON-BLOCKING]
+```
+
+---
+
+### 16.2 Creating `CompletableFuture`
+
+```java
+// Run an async task on the common ForkJoinPool
+CompletableFuture<String> future = CompletableFuture.supplyAsync(() -> {
+    return fetchDataFromNetwork(); // runs on ForkJoinPool.commonPool()
+});
+
+// Run on a custom executor (RECOMMENDED on Android)
+ExecutorService ioPool = createIoBoundPool();
+CompletableFuture<String> future2 = CompletableFuture.supplyAsync(() -> {
+    return fetchDataFromNetwork();
+}, ioPool);
+
+// Async task with no return value
+CompletableFuture<Void> voidFuture = CompletableFuture.runAsync(() -> {
+    saveToDatabase(data);
+}, ioPool);
+
+// Manually completed future
+CompletableFuture<User> manualFuture = new CompletableFuture<>();
+// Later, from any thread:
+manualFuture.complete(user);       // or
+manualFuture.completeExceptionally(new IOException("Network error"));
+```
+
+---
+
+### 16.3 Chaining Transformations
+
+```java
+CompletableFuture.supplyAsync(() -> fetchUserJson(userId), ioPool)
+    .thenApply(json -> parseUser(json))                  // transform: String → User (same thread)
+    .thenApplyAsync(user -> enrichUser(user), ioPool)    // transform on ioPool thread
+    .thenAccept(user -> {                                 // consume result (no return)
+        // ⚠️ This runs on the ioPool thread, NOT the Main Thread!
+        // To update UI, you still need to post to the Main Thread:
+        new Handler(Looper.getMainLooper()).post(() -> showUser(user));
+    })
+    .exceptionally(throwable -> {                         // handle errors in the chain
+        Log.e("TAG", "Failed to fetch user", throwable);
+        return null;
+    });
+```
+
+#### Key Chaining Methods
+
+| Method | Input → Output | Thread |
+|---|---|---|
+| `thenApply(fn)` | `T → U` | Same thread as previous stage |
+| `thenApplyAsync(fn)` | `T → U` | ForkJoinPool (or custom executor) |
+| `thenApplyAsync(fn, executor)` | `T → U` | Specified executor |
+| `thenAccept(consumer)` | `T → void` | Same thread |
+| `thenRun(runnable)` | `void → void` | Same thread |
+| `thenCompose(fn)` | `T → CompletableFuture<U>` | Flattens nested futures (like `flatMap`) |
+
+---
+
+### 16.4 Composing Multiple Futures
+
+```java
+CompletableFuture<User> userFuture = CompletableFuture.supplyAsync(
+    () -> fetchUser(userId), ioPool);
+CompletableFuture<List<Order>> ordersFuture = CompletableFuture.supplyAsync(
+    () -> fetchOrders(userId), ioPool);
+
+// Combine two futures when BOTH complete
+CompletableFuture<UserProfile> combined = userFuture.thenCombine(ordersFuture,
+    (user, orders) -> new UserProfile(user, orders));
+
+// Wait for ALL futures to complete (returns CompletableFuture<Void>)
+CompletableFuture<Void> all = CompletableFuture.allOf(userFuture, ordersFuture);
+all.thenRun(() -> Log.d("TAG", "All requests done!"));
+
+// Wait for ANY one future to complete (first wins)
+CompletableFuture<Object> any = CompletableFuture.anyOf(userFuture, ordersFuture);
+```
+
+---
+
+### 16.5 Exception Handling
+
+```java
+CompletableFuture.supplyAsync(() -> riskyOperation(), ioPool)
+    .thenApply(result -> transform(result))
+    .exceptionally(throwable -> {
+        // Catches exceptions from ANY previous stage
+        Log.e("TAG", "Error", throwable);
+        return defaultValue; // recover with a fallback
+    })
+    .handle((result, throwable) -> {
+        // Called whether success or failure — like a finally block
+        if (throwable != null) {
+            return handleError(throwable);
+        }
+        return processResult(result);
+    })
+    .whenComplete((result, throwable) -> {
+        // Like handle() but doesn't transform the result
+        if (throwable != null) {
+            Log.e("TAG", "Pipeline failed", throwable);
+        }
+    });
+```
+
+---
+
+### 16.6 `CompletableFuture` on Android — Main Thread Delivery
+
+`CompletableFuture` has no built-in awareness of the Android Main Thread. You must manually post results:
+
+```java
+public class AsyncHelper {
+    private static final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private static final ExecutorService ioPool = createIoBoundPool();
+
+    /**
+     * Runs a Callable on the I/O pool, delivers the result on the Main Thread.
+     */
+    public static <T> void runAsync(Callable<T> task,
+                                     Consumer<T> onSuccess,
+                                     Consumer<Throwable> onError) {
+        CompletableFuture.supplyAsync(() -> {
+            try {
+                return task.call();
+            } catch (Exception e) {
+                throw new CompletionException(e);
+            }
+        }, ioPool).whenComplete((result, throwable) -> {
+            mainHandler.post(() -> {
+                if (throwable != null) {
+                    onError.accept(throwable.getCause() != null ? throwable.getCause() : throwable);
+                } else {
+                    onSuccess.accept(result);
+                }
+            });
+        });
+    }
+}
+
+// Usage:
+AsyncHelper.runAsync(
+    () -> apiService.getUser("123"),
+    user -> nameTextView.setText(user.getName()),     // Main Thread
+    error -> Toast.makeText(ctx, error.getMessage(), Toast.LENGTH_SHORT).show()
+);
+```
+
+---
+
+### 16.7 `CompletableFuture` vs `Future` vs `ListenableFuture`
+
+| Feature | `Future` | `CompletableFuture` | `ListenableFuture` (Guava) |
+|---|---|---|---|
+| Blocking `get()` | ✅ | ✅ | ✅ |
+| Non-blocking callbacks | ❌ | ✅ | ✅ |
+| Chain transformations | ❌ | ✅ (`thenApply`, `thenCompose`) | ✅ (`transform()`) |
+| Compose multiple | ❌ | ✅ (`allOf`, `anyOf`, `thenCombine`) | ✅ (`Futures.allAsList()`) |
+| Exception handling | Only via `ExecutionException` | ✅ (`exceptionally`, `handle`) | ✅ (`catching()`) |
+| Manual completion | ❌ | ✅ (`complete()`) | Via `SettableFuture` |
+| Android availability | All APIs | API 24+ (no desugaring support — API 24 is the hard minimum) | Via Guava dependency |
+
+> ⚠️ **On Android, always provide a custom `Executor`** to `*Async` methods. The default `ForkJoinPool.commonPool()` has no Android-specific thread priority management and may interfere with the Main Thread.
+
+---
+
+## 17. Concurrent Collections
+
+### 17.1 The Problem with Standard Collections
+
+Standard Java collections (`HashMap`, `ArrayList`, `LinkedList`) are **not thread-safe**. Concurrent access without synchronization causes `ConcurrentModificationException`, corrupted data, or infinite loops (in `HashMap` due to rehashing).
+
+```java
+// ❌ DANGEROUS: HashMap accessed from multiple threads
+Map<String, User> userCache = new HashMap<>(); // NOT thread-safe!
+
+// Thread A
+userCache.put("user1", new User("Alice"));  // may corrupt internal structure
+
+// Thread B
+User u = userCache.get("user1");            // may see null, partial state, or infinite loop
+```
+
+---
+
+### 17.2 `ConcurrentHashMap<K, V>`
+
+The go-to thread-safe `Map` implementation. Uses **fine-grained locking** (lock striping / CAS operations) for high concurrent throughput — vastly superior to `Collections.synchronizedMap()`.
+
+```java
+ConcurrentHashMap<String, User> cache = new ConcurrentHashMap<>();
+
+// Basic operations — all thread-safe
+cache.put("user1", user);
+User u = cache.get("user1");
+cache.remove("user1");
+
+// Atomic compound operations (the KEY advantage over synchronizedMap)
+cache.putIfAbsent("user1", user);          // insert only if key not present
+cache.computeIfAbsent("user1", key -> loadUser(key)); // compute value lazily
+cache.computeIfPresent("user1", (key, val) -> val.withUpdatedTimestamp());
+cache.compute("user1", (key, existing) -> {
+    return existing != null ? existing.merge(newData) : newData;
+});
+cache.merge("user1", newUser, (oldVal, newVal) -> oldVal.merge(newVal));
+
+// Atomic replace
+cache.replace("user1", updatedUser);                    // replace if key exists
+cache.replace("user1", expectedOldUser, updatedUser);   // CAS-style replace
+
+// Bulk operations (Java 8+) — parallel-friendly
+cache.forEach(2, (key, value) -> Log.d("TAG", key + "=" + value)); // parallelism threshold=2
+long count = cache.mappingCount();  // preferred over size() for concurrent use
+```
+
+#### Why NOT `Collections.synchronizedMap()`?
+
+```java
+// synchronizedMap wraps EVERY method call in synchronized(mutex)
+Map<String, User> syncMap = Collections.synchronizedMap(new HashMap<>());
+
+// ❌ Compound operations are NOT atomic even with synchronizedMap:
+if (!syncMap.containsKey("user1")) {   // another thread may insert between these two calls
+    syncMap.put("user1", user);         // TOCTOU race condition!
+}
+
+// ✅ ConcurrentHashMap has atomic compound operations:
+concurrentMap.putIfAbsent("user1", user);  // single atomic operation
+```
+
+---
+
+### 17.3 `CopyOnWriteArrayList<E>`
+
+A **thread-safe `List`** that creates a **new copy of the underlying array on every write** (add, set, remove). Reads are lock-free and fast.
+
+```java
+CopyOnWriteArrayList<EventListener> listeners = new CopyOnWriteArrayList<>();
+
+// Adding a listener (creates a new array copy)
+listeners.add(listener);
+
+// Iterating (reads the snapshot — never throws ConcurrentModificationException)
+for (EventListener l : listeners) {
+    l.onEvent(event); // safe even if another thread calls add/remove during iteration
+}
+
+// Removing (creates another new array copy)
+listeners.remove(listener);
+```
+
+**When to use**: Read-heavy, write-rare scenarios like observer/listener lists (which Android uses heavily). Terrible for frequently-modified lists due to the copy cost.
+
+**Complexity**:
+- Read / iterate: **O(1)** per access (array read), no locking
+- Write (add/remove): **O(n)** (copies entire array)
+
+---
+
+### 17.4 `CopyOnWriteArraySet<E>`
+
+Same copy-on-write semantics as `CopyOnWriteArrayList`, but enforces **uniqueness** (like a `Set`). Backed by a `CopyOnWriteArrayList` internally.
+
+```java
+CopyOnWriteArraySet<String> activeUsers = new CopyOnWriteArraySet<>();
+activeUsers.add("user1"); // adds only if not already present
+```
+
+---
+
+### 17.5 `ConcurrentLinkedQueue<E>` and `ConcurrentLinkedDeque<E>`
+
+Non-blocking, lock-free queue/deque for high-throughput scenarios where you do NOT need blocking (`put`/`take`). Uses CAS internally.
+
+```java
+ConcurrentLinkedQueue<Event> eventQueue = new ConcurrentLinkedQueue<>();
+
+// Producer (never blocks)
+eventQueue.offer(event);
+
+// Consumer (returns null if empty — never blocks)
+Event e = eventQueue.poll();
+```
+
+Use `ConcurrentLinkedQueue` when you need a thread-safe queue but do **not** need the blocking semantics of `BlockingQueue`.
+
+---
+
+### 17.6 `ConcurrentSkipListMap<K, V>` and `ConcurrentSkipListSet<E>`
+
+Thread-safe, **sorted** map/set implementations. Equivalent of `TreeMap`/`TreeSet` for concurrent access. Uses skip list data structure (probabilistic balancing).
+
+```java
+ConcurrentSkipListMap<Long, Event> timeline = new ConcurrentSkipListMap<>();
+timeline.put(timestamp, event);
+
+// Range queries (thread-safe!)
+NavigableMap<Long, Event> lastHour = timeline.tailMap(oneHourAgo, true);
+```
+
+---
+
+### 17.7 Decision Guide
+
+| Scenario | Recommended Collection |
+|---|---|
+| Thread-safe `Map`, general purpose | `ConcurrentHashMap` |
+| Thread-safe `Map`, sorted keys needed | `ConcurrentSkipListMap` |
+| Thread-safe `List`, read-heavy, write-rare | `CopyOnWriteArrayList` |
+| Thread-safe `Set`, read-heavy, write-rare | `CopyOnWriteArraySet` |
+| Thread-safe `Set`, sorted, concurrent writes | `ConcurrentSkipListSet` |
+| Thread-safe `Queue`, non-blocking | `ConcurrentLinkedQueue` |
+| Thread-safe `Queue`, blocking (producer-consumer) | `LinkedBlockingQueue` / `ArrayBlockingQueue` |
+| Simple wrapper (low-concurrency) | `Collections.synchronizedXxx()` |
+
+---
+
+## 18. `ScheduledExecutorService`
+
+### 18.1 Overview
+
+`ScheduledExecutorService` extends `ExecutorService` to support **delayed and periodic task execution**. It is the modern replacement for `java.util.Timer` (which has several flaws: single-threaded, no exception handling, sensitive to clock changes).
+
+```java
+ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2,
+    new PriorityThreadFactory("scheduler", Process.THREAD_PRIORITY_BACKGROUND));
+```
+
+---
+
+### 18.2 Scheduling Methods
+
+```java
+// 1. One-shot delay: run once after 5 seconds
+ScheduledFuture<?> delayed = scheduler.schedule(() -> {
+    Log.d("TAG", "Runs after 5 seconds");
+}, 5, TimeUnit.SECONDS);
+
+// 2. One-shot with return value
+ScheduledFuture<String> delayedResult = scheduler.schedule(() -> {
+    return fetchData(); // Callable
+}, 5, TimeUnit.SECONDS);
+
+// 3. Fixed-RATE: starts a new execution every N time units (regardless of how long each execution takes)
+// Period measured from START of one execution to START of the next
+ScheduledFuture<?> fixedRate = scheduler.scheduleAtFixedRate(() -> {
+    pollSensor();
+}, 0 /* initial delay */, 1 /* period */, TimeUnit.SECONDS);
+
+// 4. Fixed-DELAY: waits N time units AFTER each execution completes before starting the next
+// Delay measured from END of one execution to START of the next
+ScheduledFuture<?> fixedDelay = scheduler.scheduleWithFixedDelay(() -> {
+    syncWithServer(); // if this takes 3s, next run starts 3s + 1s = 4s after this one started
+}, 0, 1, TimeUnit.SECONDS);
+```
+
+---
+
+### 18.3 `scheduleAtFixedRate` vs `scheduleWithFixedDelay`
+
+```
+scheduleAtFixedRate(task, 0, 1s):
+    ├─ T=0s:  task starts (takes 200ms)
+    ├─ T=1s:  task starts (takes 200ms)    ← 1s from LAST START
+    ├─ T=2s:  task starts (takes 200ms)
+    └─ ...
+
+    If a task execution takes LONGER than the period (e.g., 1.5s):
+    ├─ T=0s:  task starts (takes 1.5s)
+    ├─ T=1.5s: task starts IMMEDIATELY (it's already past T=1s)  ← no overlap, but catches up
+    ├─ T=2s:  task starts (if finished)
+    └─ ...
+
+scheduleWithFixedDelay(task, 0, 1s):
+    ├─ T=0s:    task starts (takes 200ms, ends at 200ms)
+    ├─ T=1.2s:  task starts (1s after END of previous)
+    ├─ T=2.4s:  task starts (1s after END of previous)
+    └─ ...
+```
+
+| Aspect | `scheduleAtFixedRate` | `scheduleWithFixedDelay` |
+|---|---|---|
+| Period reference | Start of previous execution | End of previous execution |
+| Use case | Polling, sampling at regular intervals | Tasks where you want breathing room between executions |
+| If task exceeds period | Next execution starts immediately (no overlap) | Next execution starts `delay` after completion |
+| Risk | Tasks can pile up if consistently slow | Frequency varies with task duration |
+
+---
+
+### 18.4 Exception Handling
+
+> ⚠️ **Critical**: If a scheduled task throws an **uncaught exception**, the `ScheduledExecutorService` **silently cancels all future executions** of that task. No error is logged!
+
+```java
+// ❌ DANGEROUS: uncaught exception kills the schedule silently
+scheduler.scheduleAtFixedRate(() -> {
+    String data = fetchData(); // if this throws, the schedule STOPS silently
+    process(data);
+}, 0, 30, TimeUnit.SECONDS);
+
+// ✅ CORRECT: always wrap in try-catch
+scheduler.scheduleAtFixedRate(() -> {
+    try {
+        String data = fetchData();
+        process(data);
+    } catch (Exception e) {
+        Log.e("TAG", "Scheduled task failed, will retry next period", e);
+        // Do NOT re-throw — this would cancel the schedule
+    }
+}, 0, 30, TimeUnit.SECONDS);
+```
+
+---
+
+### 18.5 Cancellation
+
+```java
+ScheduledFuture<?> future = scheduler.scheduleAtFixedRate(task, 0, 1, TimeUnit.SECONDS);
+
+// Cancel the periodic task
+future.cancel(false); // false = don't interrupt if currently running; true = interrupt
+boolean wasCancelled = future.isCancelled();
+
+// Shutdown the entire scheduler
+scheduler.shutdown();
+```
+
+---
+
+### 18.6 `ScheduledExecutorService` vs Android `Handler.postDelayed()`
+
+| Aspect | `ScheduledExecutorService` | `Handler.postDelayed()` |
+|---|---|---|
+| Thread | Runs on pool thread | Runs on the Handler's Looper thread |
+| Periodic tasks | Built-in (`scheduleAtFixedRate`) | Manual re-posting required |
+| Clock reference | `System.nanoTime()` (monotonic) | `SystemClock.uptimeMillis()` (monotonic, excludes deep sleep) |
+| Lifecycle awareness | None (must manage manually) | Can remove callbacks in `onDestroy()` |
+| Use case | Background periodic work (polling, heartbeat) | UI animations, delayed UI actions |
+
+> **On Android**: For **UI-related** delays, prefer `Handler.postDelayed()`. For **background periodic work** that doesn't touch UI, prefer `ScheduledExecutorService`. For **guaranteed background work** that survives process death, use `WorkManager`.
+
+---
+
+## 19. Virtual Threads and Project Loom
+
+### 19.1 What Are Virtual Threads?
+
+**Virtual Threads** (introduced in **JDK 21** as a final feature via [JEP 444](https://openjdk.org/jeps/444)) are lightweight threads managed by the JVM rather than the OS. Unlike platform threads (which map 1:1 to OS threads and cost ~1 MB of stack each), virtual threads are:
+
+- **Extremely lightweight**: ~1 KB initial stack, grows on demand
+- **Cheap to create**: millions can exist simultaneously
+- **Automatically yielding**: when a virtual thread blocks on I/O, the JVM unmounts it from the underlying platform (carrier) thread and mounts another virtual thread — no OS thread is wasted
+
+```java
+// Desktop JDK 21+ example (NOT available on Android as of 2026):
+try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+    for (int i = 0; i < 100_000; i++) {
+        executor.submit(() -> {
+            // Each task gets its own virtual thread
+            // Blocking I/O here does NOT waste an OS thread
+            return fetchFromNetwork();
+        });
+    }
+}
+```
+
+---
+
+### 19.2 Android Status (as of 2026)
+
+> ⚠️ **Virtual Threads are NOT available on Android.** Android uses the **ART (Android Runtime)**, not desktop OpenJDK/HotSpot. As of Android 16 (API 36) and the current ART runtime, virtual threads are not supported.
+
+The ART team has not announced plans for virtual thread support. Android's approach to lightweight concurrency is through **Kotlin Coroutines**, which provide similar benefits (cooperative scheduling, lightweight, structured concurrency) at the language/library level rather than the JVM level.
+
+### 19.3 What This Means for Android Java Developers
+
+For I/O-bound concurrent work in Android Java (without Kotlin), your options remain:
+
+1. **`ThreadPoolExecutor`** — with appropriately sized I/O pools (Section 14)
+2. **`CompletableFuture`** — for composable async pipelines (Section 16)
+3. **`RxJava`** — reactive streams with built-in scheduler management
+4. **Kotlin Coroutines** — the recommended modern approach (requires Kotlin adoption)
+
+If/when virtual threads come to Android, the migration path from `ThreadPoolExecutor` should be straightforward — virtual threads use the same `Thread` API, and `ExecutorService` can be backed by virtual threads via `Executors.newVirtualThreadPerTaskExecutor()`.
+
+---
+
 ## Summary: Quick Reference
 
 | Component | Purpose | Android API |
@@ -2865,27 +3515,33 @@ Log.d(TAG, "Active threads: " + threadCount + " (~" + estimatedStackMb + " MB st
 | `Runnable` | Task with no return value | Java |
 | `Callable<V>` | Task with return value + checked exception | Java |
 | `Future<V>` | Handle to async result; cancel/get | Java |
+| `CompletableFuture<V>` | Composable async pipelines; non-blocking chaining | Java 8 / Android API 24+ |
 | `Handler` | Post messages/runnables to a Looper | Android |
 | `Looper` | Message loop for a thread | Android |
 | `HandlerThread` | Thread + Looper, ready to use | Android |
 | `volatile` | Visibility guarantee (no atomicity) | Java |
 | `synchronized` | Mutual exclusion + visibility | Java |
+| `ThreadLocal<T>` | Per-thread independent storage | Java |
 | `AtomicInteger` | Lock-free integer ops | Java |
 | `AtomicBoolean` | Lock-free boolean flag | Java |
 | `AtomicReference<V>` | Lock-free object reference swap | Java |
 | `ReentrantLock` | Explicit lock with tryLock/timeout | Java |
 | `ReentrantReadWriteLock` | Multi-reader / single-writer | Java |
-| `StampedLock` | Optimistic read, high-throughput | Java 8 / Android API 26+ |
+| `StampedLock` | Optimistic read, high-throughput | Java 8 / Android API 24+ |
 | `CountDownLatch` | Wait for N events | Java |
 | `CyclicBarrier` | Rendezvous point for N threads | Java |
 | `Semaphore` | Resource pool access control | Java |
 | `BlockingQueue` | Thread-safe producer-consumer queue | Java |
+| `ConcurrentHashMap` | Thread-safe map with atomic compound ops | Java |
+| `CopyOnWriteArrayList` | Thread-safe list (read-heavy) | Java |
+| `ConcurrentLinkedQueue` | Non-blocking thread-safe queue | Java |
 | `ThreadPoolExecutor` | Configurable thread pool | Java |
+| `ScheduledExecutorService` | Delayed and periodic task execution | Java |
 | `ForkJoinPool` | Work-stealing pool for divide-and-conquer | Java (API 21+) |
 | `Choreographer` | VSYNC frame scheduling | Android |
 | `MessageQueue` | Ordered message store for a Looper | Android |
 
 ---
 
-*This document covers the foundation of multithreading in Android with Java. For modern Android development, consider also exploring Kotlin Coroutines and Flow, which build on these primitives to provide structured concurrency with cancellation and lifecycle-awareness built in.*
+*This document covers the foundation of multithreading in Android with Java — from low-level primitives to thread pools, concurrent collections, and modern async composition with `CompletableFuture`. For modern Android development, consider also exploring Kotlin Coroutines and Flow, which build on these primitives to provide structured concurrency with cancellation and lifecycle-awareness built in.*
 

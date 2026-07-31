@@ -41,7 +41,9 @@ ObjectAnimator slide = ObjectAnimator.ofFloat(myView, "translationX", 0f, 300f);
 slide.setDuration(300);
 slide.start();
 
-// Color change (requires ArgbEvaluator)
+// Color change — ofArgb applies ArgbEvaluator automatically (ofInt would not)
+// ⚠️ ObjectAnimator.ofArgb() requires API 21+. For API < 21, use:
+//    ValueAnimator.ofObject(new ArgbEvaluator(), Color.RED, Color.BLUE)
 ObjectAnimator colorAnim = ObjectAnimator.ofArgb(myView, "backgroundColor", Color.RED, Color.BLUE);
 colorAnim.setDuration(500);
 colorAnim.start();
@@ -87,9 +89,11 @@ set.start();
 
 ---
 
-### 5. `ViewPropertyAnimator` — Fluent API (Preferred for Simple View Anims)
+### 5. `ViewPropertyAnimator` — Fluent API (Preferred for Simple View Anims) — API 12+
 
-The cleanest, most readable API. Automatically uses hardware layers.
+> **API level:** `ViewPropertyAnimator` was introduced in **Android 3.1 (API 12)**. `ObjectAnimator` / `ValueAnimator` (the property animation system) were introduced in **Android 3.0 (API 11)**.
+
+The cleanest, most readable API. Call `.withLayer()` to render on a hardware layer for the animation's duration.
 
 ```java
 myView.animate()
@@ -98,6 +102,7 @@ myView.animate()
       .scaleX(0.9f)
       .setDuration(300)
       .setInterpolator(new FastOutSlowInInterpolator())
+      .withLayer()   // GPU-accelerate this animation; layer auto-removed on end
       .withStartAction(() -> myView.setVisibility(View.VISIBLE))
       .withEndAction(() -> myView.setVisibility(View.GONE))
       .start();
@@ -123,7 +128,9 @@ spring.start();             // bounces to 0
 
 ---
 
-### 7. `TransitionManager` — Automatic Layout Transitions
+### 7. `TransitionManager` — Automatic Layout Transitions — API 19+
+
+> **API level:** The Transition framework (`android.transition`) requires **Android 4.4 (API 19)**. For older device support, use `ViewPropertyAnimator` or `ObjectAnimator` directly.
 
 Detects layout changes and animates them automatically.
 
@@ -139,6 +146,8 @@ textView.setText("Expanded!");
 ---
 
 ### 8. `MotionLayout` — Complex Scene Animations (XML-Driven)
+
+> **Dependency:** MotionLayout is part of `androidx.constraintlayout:constraintlayout:2.0+` (current stable: 2.2.x). Add it to your `build.gradle`: `implementation("androidx.constraintlayout:constraintlayout:2.2.1")`. No separate platform API-level minimum beyond what ConstraintLayout supports.
 
 Extends `ConstraintLayout`. Defines start/end constraint states and transitions.
 
@@ -197,6 +206,51 @@ imageView.setImageResource(R.drawable.loading_spinner);
 AnimationDrawable spinner = (AnimationDrawable) imageView.getDrawable();
 // Must start after view is attached
 imageView.post(() -> spinner.start());
+```
+
+---
+
+### 10. `AnimatedVectorDrawable` (AVD) — Animate Vector Assets — API 21+
+
+> **API level:** `AnimatedVectorDrawable` (platform class) requires **Android 5.0 (API 21)**. For backwards compatibility down to API 14, use `AnimatedVectorDrawableCompat` from `androidx.vectordrawable:vectordrawable-animated`.
+
+Perfect for animating icons (e.g., play to pause button). Ties vector graphic properties (like path data or rotation) to `ObjectAnimator` XMLs.
+
+```xml
+<!-- res/drawable/avd_play_to_pause.xml -->
+<animated-vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:drawable="@drawable/vd_play">
+    <target
+        android:name="play_path"
+        android:animation="@animator/path_morph_play_to_pause" />
+</animated-vector>
+```
+
+```java
+imageView.setImageResource(R.drawable.avd_play_to_pause);
+Drawable drawable = imageView.getDrawable();
+if (drawable instanceof Animatable) {
+    ((Animatable) drawable).start();
+}
+```
+
+---
+
+### 11. Activity & Fragment Transitions (Shared Elements) — API 21+
+
+> **API level:** Activity transition APIs (including `ActivityOptions.makeSceneTransitionAnimation`) require **Android 5.0 (API 21)**. There is no AndroidX backport for View-system Activity transitions.
+
+Animate views across different screens.
+
+```java
+// Transitions between Activities
+ActivityOptionsCompat options = ActivityOptionsCompat.makeSceneTransitionAnimation(
+        this, 
+        heroImageView, 
+        "hero_transition_name"
+);
+Intent intent = new Intent(this, DetailActivity.class);
+startActivity(intent, options.toBundle());
 ```
 
 ---
@@ -315,7 +369,59 @@ Crossfade(targetState = currentScreen, animationSpec = tween(400), label = "scre
 
 ---
 
-### 5. `updateTransition` — Coordinate Multiple Properties
+### 5. `Modifier.animateContentSize()` — Automatic Size Animation
+
+The easiest way to animate size changes of a composable when its content changes (e.g., expanding text).
+
+```kotlin
+var expanded by remember { mutableStateOf(false) }
+
+Text(
+    text = if (expanded) "Very very very very very long text..." else "Short text",
+    modifier = Modifier
+        .background(Color.LightGray)
+        .animateContentSize(animationSpec = spring(stiffness = Spring.StiffnessLow))
+        .clickable { expanded = !expanded }
+        .padding(16.dp)
+)
+```
+
+---
+
+### 6. Shared Element Transitions (Compose)
+
+Animates elements across navigation boundaries or screen state changes. Used in conjunction with `SharedTransitionLayout` and `AnimatedContent` or Navigation Compose.
+
+```kotlin
+var showDetails by remember { mutableStateOf(false) }
+
+SharedTransitionLayout {
+    AnimatedContent(
+        targetState = showDetails,
+        label = "shared_element"
+    ) { targetState ->
+        if (targetState) {
+            DetailScreen(
+                modifier = Modifier.sharedElement(
+                    sharedContentState = rememberSharedContentState(key = "image"),
+                    animatedVisibilityScope = this@AnimatedContent
+                )
+            )
+        } else {
+            ListScreen(
+                modifier = Modifier.sharedElement(
+                    sharedContentState = rememberSharedContentState(key = "image"),
+                    animatedVisibilityScope = this@AnimatedContent
+                )
+            )
+        }
+    }
+}
+```
+
+---
+
+### 7. `updateTransition` — Coordinate Multiple Properties
 
 Ideal when **multiple properties** must animate in sync from the same state.
 
@@ -342,7 +448,7 @@ Card(
 
 ---
 
-### 6. `Animatable` — Full Manual / Imperative Control
+### 8. `Animatable` — Full Manual / Imperative Control
 
 Used in coroutines. Gives you `animateTo`, `snapTo`, `stop`, and value clamping.
 
@@ -381,7 +487,7 @@ Box(
 
 ---
 
-### 7. `rememberInfiniteTransition` — Looping Animations
+### 9. `rememberInfiniteTransition` — Looping Animations
 
 ```kotlin
 val infiniteTransition = rememberInfiniteTransition(label = "pulse")
@@ -417,7 +523,7 @@ Box(
 
 ---
 
-### 8. Animation Specs — Control the Feel
+### 10. Animation Specs — Control the Feel
 
 ```kotlin
 // 1. tween — fixed duration with easing curve
@@ -467,8 +573,14 @@ Do you need animation in Views?
 ├─ Animating a real property (alpha, rotation, color)?
 │   └─ ✅ ObjectAnimator
 │
+├─ Animating a vector icon (e.g., play to pause)?
+│   └─ ✅ AnimatedVectorDrawable
+│
 ├─ Multiple animators in sequence or parallel?
 │   └─ ✅ AnimatorSet
+│
+├─ Moving a view between different screens/activities?
+│   └─ ✅ ActivityOptionsCompat (Shared Elements)
 │
 ├─ Automatic layout change animation?
 │   └─ ✅ TransitionManager.beginDelayedTransition()
@@ -490,11 +602,17 @@ Do you need animation in Compose?
 ├─ Single value changes with state?
 │   └─ ✅ animate*AsState  →  animateFloatAsState, animateDpAsState, etc.
 │
+├─ Size changes due to content?
+│   └─ ✅ Modifier.animateContentSize()
+│
 ├─ Show/hide a composable?
 │   └─ ✅ AnimatedVisibility
 │
 ├─ Swap between two composables with crossfade?
 │   └─ ✅ Crossfade
+│
+├─ Move an element between screens / states smoothly?
+│   └─ ✅ SharedTransitionLayout + Modifier.sharedElement
 │
 ├─ Complex content swap with custom transitions?
 │   └─ ✅ AnimatedContent
@@ -516,9 +634,12 @@ Do you need animation in Compose?
 | Use Case | Android Views | Jetpack Compose |
 |---|---|---|
 | Fade in/out | `view.animate().alpha()` | `AnimatedVisibility` + `fadeIn/fadeOut` |
+| Size expand | `ValueAnimator` + `setLayoutParams` | `Modifier.animateContentSize()` |
+| Shared Element | `ActivityOptionsCompat` | `SharedTransitionLayout` |
 | Slide in/out | `ViewPropertyAnimator.translationX/Y` | `AnimatedVisibility` + `slideIn*` |
 | Show/hide | `setVisibility` + `TransitionManager` | `AnimatedVisibility` |
 | Color transition | `ObjectAnimator.ofArgb` | `animateColorAsState` |
+| Vector Morph | `AnimatedVectorDrawable` | `AnimatedVectorDrawable` / `Lottie` |
 | Content swap | `ViewFlipper` / `ViewSwitcher` | `Crossfade` / `AnimatedContent` |
 | Multiple props sync | `AnimatorSet` | `updateTransition` |
 | Looping animation | `ObjectAnimator.setRepeatCount(INFINITE)` | `rememberInfiniteTransition` |
@@ -576,11 +697,24 @@ view.animate().scaleX(1.5f).scaleY(1.5f).start();
 
 ### ✅ DO: Respect Accessibility (Reduced Motion)
 
+**Note:** Standard Jetpack Compose animations (e.g., `animateFloatAsState`, `AnimatedVisibility`)
+automatically respect the system's `Settings.Global.ANIMATOR_DURATION_SCALE` setting. No extra
+code is needed for built-in animations to honor reduced motion preferences.
+
+For **custom animation logic** that needs to manually check reduced motion, query the system
+setting via `LocalContext.current`:
+
 ```kotlin
-// Compose
+// Standard Compose — manual check for custom animations
 @Composable
 fun AccessibleAnimation() {
-    val reduceMotion = LocalReduceMotion.current
+    val context = LocalContext.current
+    val reduceMotion = remember {
+        Settings.Global.getFloat(
+            context.contentResolver,
+            Settings.Global.ANIMATOR_DURATION_SCALE, 1f
+        ) == 0f
+    }
 
     val duration = if (reduceMotion) 0 else 400
 
@@ -591,6 +725,10 @@ fun AccessibleAnimation() {
     )
 }
 ```
+
+> **Wear OS only:** Wear OS Compose provides `LocalReduceMotion` via
+> `androidx.wear.compose.foundation.LocalReduceMotion`. This `CompositionLocal` is **not**
+> available in standard Jetpack Compose.
 
 ```java
 // Views
@@ -734,3 +872,5 @@ LaunchedEffect(Unit) {
 | Expand / collapse | 250–400ms |
 | Complex transitions | 300–500ms |
 | Never exceed | 500ms for UI, 1s for hero animations |
+
+
